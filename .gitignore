@@ -1,0 +1,55 @@
+# Python cache
+__pycache__/
+*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# WandB logs
+wandb/
+*.wandb
+**/*.log
+
+# Model checkpoints
+
+# *.pt
+# *.pth
+*.ckpt
+checkpoints/
+save/
+
+# # Data files
+# *.bin
+# *.npy
+# *.npz
+# *.h5
+# *.csv
+# *.tsv
+# *.json
+
+# Logs and debug output
+*.log
+logs/
+debug.log
+
+# System-specific
+.DS_Store
+Thumbs.db
+
+# VSCode settings
+.vscode/
+
+# Conda or pip environments
+*.conda
+*.egg-info/
+*.egg
