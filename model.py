@@ -55,10 +55,10 @@ class BigramLanguageModel(nn.Module):
         """
 
         # ========= TODO : START ========= #
-
+        # Logits size (batch_size, seq_len, vocab_size), where seq_len=1 for bigram model
         embeds = self.embeddings(x).squeeze(1) # (batch_size, embed_dim)
         output = self.dropout(self.linear(embeds)) # (batch_siz, vocab_size)
-        return output
+        return output 
     
         # ========= TODO : END ========= #
 
@@ -97,9 +97,16 @@ class BigramLanguageModel(nn.Module):
         """
 
         ### ========= TODO : START ========= ###
-
-        raise NotImplementedError
-
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
+        
+        curr = context[:, -1:] # Get last token
+        for _ in range(max_new_tokens):
+            logits = self.forward(curr)
+            probs = nn.Softmax(dim=-1)(logits)
+            curr = torch.multinomial(probs, num_samples=1)
+            context = torch.cat([context, curr], dim=1)
+        return context.squeeze(0)
         ### ========= TODO : END ========= ###
 
 

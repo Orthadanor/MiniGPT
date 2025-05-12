@@ -18,7 +18,7 @@ from config import BigramConfig, MiniGPTConfig
 def solver(model_name):
     # Initialize the model
     if model_name == "bigram":
-        config = BigramConfig
+        config = BigramConfig(log_interval=1000, batch_size=128, save_iterations=50000)
         model = BigramLanguageModel(config)
     elif model_name == "minigpt":
         config = MiniGPTConfig
@@ -37,13 +37,13 @@ def solver(model_name):
     )
 
     # Create the dataloaders
-    train_dataloader = DataLoader(
+    train_dataloader = DataLoader( # len(train_dataloader) =  118398
         train_dataset, batch_size=config.batch_size, pin_memory=True, num_workers=4
-    )
-    eval_dataloader = DataLoader(
+    ) 
+    eval_dataloader = DataLoader( # len(eval_dataloader) =  29600
         eval_dataset, batch_size=config.batch_size, pin_memory=True, num_workers=4
-    )
-
+    ) 
+    
     # Set the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -97,7 +97,7 @@ def solver(model_name):
     model.to(device)
     
     best_eval_loss = 1e10 # Best eval loss to be updated
-    # print("len(train_dataloader) = ", len(train_dataloader))
+    print("len(train_dataloader) = ", len(train_dataloader))
     
     for i, (context, target) in enumerate(train_dataloader):
 
@@ -127,7 +127,7 @@ def solver(model_name):
             ### ======== TODO : START ========= ###
             # Compute the evaluation loss on the eval dataset.
             
-            # print("len(eval_dataloader) = ", len(eval_dataloader))
+            print("len(eval_dataloader) = ", len(eval_dataloader))
             with torch.no_grad():
                 for j, (context, target) in enumerate(eval_dataloader):
                     
@@ -157,18 +157,18 @@ def solver(model_name):
 
             model.train()
 
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": train_loss,
-                    "eval_loss": eval_loss,
-                    "iteration": i,
-                },
-                config.save_path / "best_model.pt",
-            )
+            if eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "train_loss": train_loss,
+                        "eval_loss": eval_loss,
+                        "iteration": i,
+                    },
+                    config.save_path / "best_model.pt",
+                )
         
         # Save the model every config.save_iterations
         if i % config.save_iterations == 0:
