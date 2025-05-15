@@ -53,3 +53,4 @@ class MiniGPTConfig:
     to_clip_grad: bool = False
     gradient_clip: float = 1.0
     scheduler: bool = False
+    parallelHeads: bool = False # Parallelized multi-head attention for faster computation

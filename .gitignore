@@ -28,6 +28,9 @@ wandb/
 checkpoints/
 save/
 
+models/bigram/*.csv
+models/minigpt/*.csv
+
 # # Data files
 # *.bin
 # *.npy

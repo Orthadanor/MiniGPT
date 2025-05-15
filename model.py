@@ -159,12 +159,15 @@ class SingleHeadAttention(nn.Module):
 
         # ========= TODO : START ========= #
 
-        self.key = ...
-        self.query = ...
-        self.value = ...
-        self.dropout = ...
-        causal_mask = ...
-
+        self.key = nn.Linear(self.input_dim, self.output_key_query_dim, bias=False)
+        self.query = nn.Linear(self.input_dim, self.output_key_query_dim, bias=False)
+        self.value = nn.Linear(self.input_dim, self.output_value_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        causal_mask = torch.triu(torch.full((max_len, max_len), float('-inf')), diagonal=1)
+        
+        # print("Initialized causal_mask (sanity check):")
+        # print(causal_mask[:5, :5])
+        
         # ========= TODO : END ========= #
 
         self.register_buffer(
@@ -188,10 +191,75 @@ class SingleHeadAttention(nn.Module):
         """
 
         # ========= TODO : START ========= #
+        B, N, _ = x.size() # (batch_size, num_tokens, token_dim)
+        
+        k, q = self.key(x), self.query(x) # (B, N, output_key_query_dim)
+        v = self.value(x) # (B, N, output_value_dim)
 
-        raise NotImplementedError
-
+        # Calculate the attention scores (B, N, N)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.output_key_query_dim)
+        mask = self.causal_mask[:N, :N]  # (1, N, N)?
+        mask[torch.triu(torch.ones_like(mask), diagonal=1) == 1] = float('-inf')
+        
+        # print("causal_mask loaded from test case:")
+        # print(mask[:5, :5])
+        
+        attn_scores = torch.softmax(scores + mask, dim=-1) # (B, N, N)
+        attn_scores = self.dropout(attn_scores) # (B, N, N)
+        
+        # Calculate the attention output
+        attn_output = torch.matmul(attn_scores, v) # (B, N, output_value_dim)
+        return attn_output
         # ========= TODO : END ========= #
+        
+class ParallelMHA(nn.Module):
+    def __init__(self, input_dim, num_heads, output_key_query_dim=None, output_value_dim=None, max_len=512, dropout=0.1):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.num_heads = num_heads
+
+        self.output_key_query_dim = output_key_query_dim or input_dim
+        self.output_value_dim = output_value_dim or input_dim
+
+        assert self.output_key_query_dim % num_heads == 0, "key/query dim must be divisible by num_heads"
+        assert self.output_value_dim % num_heads == 0, "value dim must be divisible by num_heads"
+
+        self.head_dim_kq = self.output_key_query_dim // num_heads
+        self.head_dim_v = self.output_value_dim // num_heads
+
+        self.q_proj = nn.Linear(input_dim, self.output_key_query_dim, bias=False)
+        self.k_proj = nn.Linear(input_dim, self.output_key_query_dim, bias=False)
+        self.v_proj = nn.Linear(input_dim, self.output_value_dim, bias=False)
+
+        self.out_proj = nn.Linear(self.output_value_dim, input_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        causal_mask = torch.triu(torch.full((max_len, max_len), float('-inf')), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask)  # Registering as buffer to avoid backpropagation
+
+    def forward(self, x):
+        B, N, _ = x.shape
+
+        # Project inputs to Q, K, V
+        q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim_kq).transpose(1, 2)  # (B, H, N, head_dim_kq)
+        k = self.k_proj(x).view(B, N, self.num_heads, self.head_dim_kq).transpose(1, 2)
+        v = self.v_proj(x).view(B, N, self.num_heads, self.head_dim_v).transpose(1, 2)    # (B, H, N, head_dim_v)
+
+        # Attention weights
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim_kq)  # (B, H, N, N)
+        # mask[torch.triu(torch.ones_like(mask), diagonal=1) == 1] = float('-inf') # for the testing bug
+        attn_weights += self.causal_mask[:N, :N]  # (N, N) → broadcasted to (B, H, N, N)
+        attn_probs = torch.softmax(attn_weights, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Weighted sum of values
+        attn_output = torch.matmul(attn_probs, v)  # (B, H, N, head_dim_v)
+
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, N, self.output_value_dim)  # (B, N, output_value_dim)
+
+        return self.out_proj(attn_output)  # Project back to input_dim
 
 
 class MultiHeadAttention(nn.Module):
@@ -218,10 +286,13 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
 
         # ========= TODO : START ========= #
+        self.head_dim = input_dim // num_heads
+        
+        for i in range(num_heads):
+            setattr(self, f"head_{i}", SingleHeadAttention(input_dim, self.head_dim, self.head_dim, MiniGPTConfig.attention_dropout)) # attention_dropout
 
-        # self.head_{i} = ... # Use setattr to implement this dynamically, this is used as a placeholder
-        self.out = ...
-        self.dropout = ...
+        self.out = nn.Linear(input_dim, input_dim, bias=True)
+        self.dropout = nn.Dropout(MiniGPTConfig.out_dropout)
 
         # ========= TODO : END ========= #
 
@@ -239,9 +310,14 @@ class MultiHeadAttention(nn.Module):
         """
 
         # ========= TODO : START ========= #
-
-        raise NotImplementedError
-
+        
+        head_output = []
+        for i in range(self.num_heads):
+            head_output.append(getattr(self, f"head_{i}")(x))
+        attn_out = self.out(torch.cat(head_output, dim=-1))
+        
+        return self.dropout(attn_out)
+    
         # ========= TODO : END ========= #
 
 
@@ -269,11 +345,10 @@ class FeedForwardLayer(nn.Module):
 
         # ========= TODO : START ========= #
 
-        self.fc1 = ...
-        self.activation = ...
-        self.fc2 = ...
-        self.fc2 = ...
-        self.dropout = ...
+        self.fc1 = nn.Linear(input_dim, feedforward_dim, bias=True)
+        self.activation = nn.GELU()
+        self.fc2 = nn.Linear(feedforward_dim, input_dim, bias=True)
+        self.dropout = nn.Dropout(dropout)
 
         # ========= TODO : END ========= #
 
@@ -292,7 +367,9 @@ class FeedForwardLayer(nn.Module):
 
         ### ========= TODO : START ========= ###
 
-        raise NotImplementedError
+        out1 = self.fc1(x)
+        out2 = self.fc2(self.activation(out1))
+        return self.dropout(out2)
 
         ### ========= TODO : END ========= ###
 
@@ -334,8 +411,9 @@ class LayerNorm(nn.Module):
         mean = None
         var = None
         # ========= TODO : START ========= #
-
-        raise NotImplementedError
+        
+        mean = torch.mean(input, dim=-1, keepdim=True)
+        var = torch.var(input, dim=-1, unbiased=False, keepdim=True)
 
         # ========= TODO : END ========= #
 
@@ -352,7 +430,7 @@ class TransformerLayer(nn.Module):
     Class definition for a single transformer layer.
     """
 
-    def __init__(self, input_dim, num_heads, feedforward_dim=None):
+    def __init__(self, input_dim, num_heads, feedforward_dim=None, parallelHeads=False):
         super().__init__()
         """
         Initialize the Transformer Layer.
@@ -369,10 +447,15 @@ class TransformerLayer(nn.Module):
 
         # ========= TODO : START ========= #
 
-        self.norm1 = ...
-        self.attention = ...
-        self.norm2 = ...
-        self.feedforward = ...
+        self.norm1 = LayerNorm(input_dim)
+        
+        if parallelHeads:
+            self.attention = ParallelMHA(input_dim, num_heads)
+        else:
+            self.attention = MultiHeadAttention(input_dim, num_heads)
+        # self.attention = ParallelMHA(input_dim, num_heads)
+        self.norm2 = LayerNorm(input_dim)
+        self.feedforward = FeedForwardLayer(input_dim, feedforward_dim, MiniGPTConfig.feedforward_dropout)
 
         # ========= TODO : END ========= #
 
@@ -391,7 +474,12 @@ class TransformerLayer(nn.Module):
 
         # ========= TODO : START ========= #
 
-        raise NotImplementedError
+        norm1 = self.norm1(x)
+        sub1 = x + self.attention(norm1)
+        norm2 = self.norm2(sub1)
+        sub2 = self.feedforward(norm2)
+        
+        return sub2 + sub1
 
         # ========= TODO : END ========= #
 
@@ -428,8 +516,8 @@ class MiniGPT(nn.Module):
         self.transformer_layers = nn.ModuleList(
             [
                 TransformerLayer(
-                    config.embed_dim, config.num_heads, config.feedforward_size
-                )
+                    config.embed_dim, config.num_heads, config.feedforward_size, config.parallelHeads
+                ) ############### Parallel Multihead Attn configuration added ###############
                 for _ in range(config.num_layers)
             ]
         )
@@ -469,8 +557,19 @@ class MiniGPT(nn.Module):
         """
 
         ### ========= TODO : START ========= ###
+        B, seq_len = x.shape
+        
+        input = self.vocab_embedding(x) + self.positional_embedding(self.pos[:seq_len]) 
+        input = self.embed_dropout(input) # (B, seq_len, embed_dim)
+        
+        for layer in self.transformer_layers:
+            input = layer(input)
+        prehead = input
 
-        raise NotImplementedError
+        prehead = self.prehead_norm(prehead)
+        out = self.head(prehead)
+
+        return out
 
         ### ========= TODO : END ========= ###
 
@@ -508,7 +607,18 @@ class MiniGPT(nn.Module):
         """
 
         ### ========= TODO : START ========= ###
-
-        raise NotImplementedError
+        
+        context_len = len(context)
+        
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
+        
+        for _ in range(max_new_tokens):
+            last_context = context[:, -context_len:] # (batch_size, seq_len)
+            logits = self.forward(last_context) # (batch_size, seq_len, vocab_size) 
+            probs = nn.Softmax(dim=-1)(logits[:, -1, :]) # Perform softmax on last token in the sequence
+            curr = torch.multinomial(probs, num_samples=1)
+            context = torch.cat([context, curr], dim=1)
+        return context.squeeze(0)
 
         ### ========= TODO : END ========= ###

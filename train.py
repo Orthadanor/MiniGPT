@@ -21,7 +21,15 @@ def solver(model_name):
         config = BigramConfig(log_interval=1000, batch_size=128, save_iterations=50000)
         model = BigramLanguageModel(config)
     elif model_name == "minigpt":
-        config = MiniGPTConfig
+        config = MiniGPTConfig(batch_size=32, num_layers=2, log_interval=100, save_iterations=100, max_iter=10000, scheduler=True)
+        # config = MiniGPTConfig( # Training configuration for parallelized Multiheaded Attention
+        #     batch_size=32, 
+        #     num_layers=2, 
+        #     log_interval=500, 
+        #     save_iterations=10000, 
+        #     max_iter=30000, 
+        #     scheduler=True
+        # )
         model = MiniGPT(config)
     else:
         raise ValueError("Invalid model name")
@@ -82,7 +90,19 @@ def solver(model_name):
 
     ### ========= TODO : START ========= ###
     # Define the loss function
-    loss_fn = nn.CrossEntropyLoss()
+    base_loss_fn = nn.CrossEntropyLoss()
+    
+    def loss_fn(logits, target, model_name):
+        if model_name == "minigpt": 
+            # logits = (batch_size, context_length, vocab_size) -> (batch_size*context_length, vocab_size)      
+            # targets = (batch_size, context_length) -> (batch_size*context_length)                   # (B * T,)
+            return base_loss_fn(logits.view(-1, logits.shape[-1]), target.view(-1))
+        elif model_name == "bigram": 
+            # logits = (batch_size, vocab_size)
+            # targets = (batch_size, context_length)
+            return base_loss_fn(logits, target.squeeze(1))                   
+        else:
+            raise ValueError(f"Unknown model_name: {model_name}")
 
     # Define the optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr = config.learning_rate)
@@ -97,7 +117,7 @@ def solver(model_name):
     model.to(device)
     
     best_eval_loss = 1e10 # Best eval loss to be updated
-    print("len(train_dataloader) = ", len(train_dataloader))
+    # print("len(train_dataloader) = ", len(train_dataloader))
     
     for i, (context, target) in enumerate(train_dataloader):
 
@@ -105,10 +125,10 @@ def solver(model_name):
         ### ======== TODO : START ========= ###
         # Do the forward pass, compute the loss, do the backward pass, and update the weights with the optimizer.
         
-        context, target = context.to(device), target.to(device) # (batch_size, context_length=1)
-        logits = model(context) # (batch_size, vocab_size)
+        context, target = context.to(device), target.to(device) # (batch_size, context_length)
+        logits = model(context) 
 
-        train_loss = loss_fn(logits, target.squeeze(1))
+        train_loss = loss_fn(logits, target, model_name)
         
         optimizer.zero_grad()
         train_loss.backward()
@@ -127,7 +147,7 @@ def solver(model_name):
             ### ======== TODO : START ========= ###
             # Compute the evaluation loss on the eval dataset.
             
-            print("len(eval_dataloader) = ", len(eval_dataloader))
+            # print("len(eval_dataloader) = ", len(eval_dataloader))
             with torch.no_grad():
                 for j, (context, target) in enumerate(eval_dataloader):
                     
@@ -136,7 +156,7 @@ def solver(model_name):
                     
                     context, target = context.to(device), target.to(device) # (batch_size, context_length=1)
                     logits = model(context)
-                    eval_loss = eval_loss + loss_fn(logits, target.squeeze(1)).item()
+                    eval_loss = eval_loss + loss_fn(logits, target.squeeze(1), model_name).item()
             eval_loss /= len(eval_dataloader)
             
             ### ======== TODO : END ========= ###
