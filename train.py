@@ -21,15 +21,15 @@ def solver(model_name):
         config = BigramConfig(log_interval=1000, batch_size=128, save_iterations=50000)
         model = BigramLanguageModel(config)
     elif model_name == "minigpt":
-        config = MiniGPTConfig(batch_size=32, num_layers=2, log_interval=100, save_iterations=100, max_iter=10000, scheduler=True)
-        # config = MiniGPTConfig( # Training configuration for parallelized Multiheaded Attention
-        #     batch_size=32, 
-        #     num_layers=2, 
-        #     log_interval=500, 
-        #     save_iterations=10000, 
-        #     max_iter=30000, 
-        #     scheduler=True
-        # )
+        config = MiniGPTConfig(  
+            batch_size=32, 
+            num_layers=2, 
+            log_interval=100, 
+            save_iterations=500, 
+            max_iter=5000, 
+            scheduler=True,
+            parallelHeads=False # Enable parallelized Multiheaded Attention
+        )
         model = MiniGPT(config)
     else:
         raise ValueError("Invalid model name")
