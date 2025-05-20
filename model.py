@@ -622,3 +622,262 @@ class MiniGPT(nn.Module):
         return context.squeeze(0)
 
         ### ========= TODO : END ========= ###
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, input_dim, num_heads, feedforward_dim=None, dropout=0.1):
+        super().__init__()
+        self.norm1 = LayerNorm(input_dim)
+        #self.attention = MultiHeadAttention(input_dim, num_heads, dropout=dropout, causal=False)
+        self.attention = ParallelMHA_Modified(input_dim, num_heads, dropout=dropout, causal=False)
+
+        self.norm2 = LayerNorm(input_dim)
+        self.feedforward = FeedForwardLayer(input_dim, feedforward_dim, dropout=dropout)
+        
+
+    def forward(self, x):
+        x = x + self.attention(self.norm1(x))
+        x = x + self.feedforward(self.norm2(x))
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.token_embedding = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.position_embedding = nn.Embedding(config.context_length, config.embed_dim)
+        self.embed_dropout = nn.Dropout(config.embed_dropout)
+
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(config.embed_dim, config.num_heads, config.feedforward_size)
+            for _ in range(config.num_layers)
+        ])
+
+        self.norm = LayerNorm(config.embed_dim)
+
+        # Precomputed positions
+        pos = torch.arange(0, config.context_length, dtype=torch.long)
+        self.register_buffer("pos", pos, persistent=False)
+
+    def forward(self, x):
+        batch_size, seq_len = x.shape
+
+        x = self.token_embedding(x)
+        pos_embed = self.position_embedding(self.pos[:seq_len]).unsqueeze(0)
+        x = x + pos_embed
+        x = self.embed_dropout(x)
+
+        for layer in self.encoder_layers:
+            x = layer(x)
+
+        x = self.norm(x)
+        return x  # Output shape: (batch_size, seq_len, embed_dim)
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, input_dim, num_heads, feedforward_dim=None, dropout=0.1):
+        super().__init__()
+        self.norm1 = LayerNorm(input_dim)
+        #self.self_attention = MultiHeadAttention(input_dim, num_heads, dropout=dropout, causal=True)
+        
+        self.self_attention = ParallelMHA_Modified(input_dim, num_heads, dropout=dropout, causal=True)
+        self.cross_attention = ParallelMHA_Modified(input_dim, num_heads, dropout=dropout, causal=False)
+
+        self.norm2 = LayerNorm(input_dim)
+        #self.cross_attention = MultiHeadAttention(input_dim, num_heads, dropout=dropout, causal=False)
+
+        self.norm3 = LayerNorm(input_dim)
+        self.feedforward = FeedForwardLayer(input_dim, feedforward_dim, dropout=dropout)
+
+    def forward(self, x, encoder_out):
+        x = x + self.self_attention(self.norm1(x))  # masked self-attention
+        x = x + self.cross_attention(self.norm2(x), encoder_out)  # encoder-decoder attention
+        x = x + self.feedforward(self.norm3(x))
+        return x
+
+class MiniTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # Encoder
+        self.src_embed = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.src_pos_embed = nn.Embedding(config.context_length, config.embed_dim)
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(config.embed_dim, config.num_heads, config.feedforward_size)
+            for _ in range(config.num_layers)
+        ])
+        self.encoder_norm = LayerNorm(config.embed_dim)
+
+        # Decoder
+        self.tgt_embed = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.tgt_pos_embed = nn.Embedding(config.context_length, config.embed_dim)
+        self.decoder_layers = nn.ModuleList([
+            TransformerDecoderLayer(config.embed_dim, config.num_heads, config.feedforward_size)
+            for _ in range(config.num_layers)
+        ])
+        self.decoder_norm = LayerNorm(config.embed_dim)
+
+        # Final head
+        self.head = nn.Linear(config.embed_dim, config.vocab_size)
+        if getattr(config, "weight_tie", False):
+            self.head.weight = self.tgt_embed.weight
+
+        pos = torch.arange(0, config.context_length, dtype=torch.long)
+        self.register_buffer("pos", pos, persistent=False)
+
+        self.dropout = nn.Dropout(config.embed_dropout)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, src, tgt):
+        """
+        src: (B, T_src)
+        tgt: (B, T_tgt)
+        """
+        B, T_src = src.shape
+        B, T_tgt = tgt.shape
+
+        src = self.src_embed(src) + self.src_pos_embed(self.pos[:T_src]).unsqueeze(0)
+        src = self.dropout(src)
+        for layer in self.encoder_layers:
+            src = layer(src)
+        src = self.encoder_norm(src)
+
+        tgt = self.tgt_embed(tgt) + self.tgt_pos_embed(self.pos[:T_tgt]).unsqueeze(0)
+        tgt = self.dropout(tgt)
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, encoder_out=src)
+        tgt = self.decoder_norm(tgt)
+
+        logits = self.head(tgt)
+        return logits
+
+    def generate(self, src, max_new_tokens=100, start_token_id=0, temperature=1.0, top_k=None):
+        """
+        Autoregressively generate tokens from the encoder-decoder model.
+
+        Args:
+            src: (B, T_src) input source sequence
+            max_new_tokens: int, number of tokens to generate
+            start_token_id: int, the token ID to start decoding with
+            temperature: float, softmax temperature
+            top_k: int or None, top-k sampling
+
+        Returns:
+            generated: (B, max_new_tokens) the generated sequence (excluding the start token)
+        """
+        self.eval()
+        with torch.no_grad():
+            B, T_src = src.shape
+            device = src.device
+
+            # Encode the source sequence
+            src_emb = self.src_embed(src) + self.src_pos_embed(self.pos[:T_src]).unsqueeze(0).to(device)
+            src_emb = self.dropout(src_emb)
+            for layer in self.encoder_layers:
+                src_emb = layer(src_emb)
+            memory = self.encoder_norm(src_emb)
+
+            # Initialize decoder input with <BOS> token
+            generated = torch.full((B, 1), start_token_id, dtype=torch.long, device=device)
+
+            for _ in range(max_new_tokens):
+                T_tgt = generated.shape[1]
+                tgt_emb = self.tgt_embed(generated) + self.tgt_pos_embed(self.pos[:T_tgt]).unsqueeze(0).to(device)
+                tgt_emb = self.dropout(tgt_emb)
+
+                for layer in self.decoder_layers:
+                    tgt_emb = layer(tgt_emb, encoder_out=memory)
+                tgt_emb = self.decoder_norm(tgt_emb)
+
+                logits = self.head(tgt_emb)  # (B, T_tgt, vocab_size)
+                next_token_logits = logits[:, -1, :] / temperature
+
+                if top_k is not None:
+                    topk_vals, _ = torch.topk(next_token_logits, top_k)
+                    threshold = topk_vals[:, -1].unsqueeze(1)
+                    next_token_logits[next_token_logits < threshold] = -float("inf")
+
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+                generated = torch.cat([generated, next_token], dim=1)
+
+        return generated[:, 1:]  
+
+## Modified the MHA module to include the following features:
+# 1. Option to use causal masking for autoregressive models, with a registered buffer for the causal mask.
+# 2. Incorporate cross-attention implementation (allowing the use of a separate key-value input (kv) for attention).
+
+
+class ParallelMHA_Modified(nn.Module):
+    def __init__(self, input_dim, num_heads, output_key_query_dim=None, output_value_dim=None, max_len=512, dropout=0.1, causal = False):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.num_heads = num_heads
+        self.causal = causal
+
+        self.output_key_query_dim = output_key_query_dim or input_dim
+        self.output_value_dim = output_value_dim or input_dim
+
+        assert self.output_key_query_dim % num_heads == 0, "key/query dim must be divisible by num_heads"
+        assert self.output_value_dim % num_heads == 0, "value dim must be divisible by num_heads"
+
+        self.head_dim_kq = self.output_key_query_dim // num_heads
+        self.head_dim_v = self.output_value_dim // num_heads
+
+        self.q_proj = nn.Linear(input_dim, self.output_key_query_dim, bias=False)
+        self.k_proj = nn.Linear(input_dim, self.output_key_query_dim, bias=False)
+        self.v_proj = nn.Linear(input_dim, self.output_value_dim, bias=False)
+
+        self.out_proj = nn.Linear(self.output_value_dim, input_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        causal_mask = torch.triu(torch.full((max_len, max_len), float('-inf')), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask)
+
+    def forward(self, x, kv=None):
+        """
+        Args:
+            x:  (B, T_q, D) — query input
+            kv: (B, T_kv, D) — key/value source (optional, if None: self-attention)
+        Returns:
+            output: (B, T_q, D)
+        """
+        B, T_q, _ = x.shape
+        if kv is None:
+            kv = x
+        T_kv = kv.size(1)
+
+        # Project to Q, K, V
+        q = self.q_proj(x).view(B, T_q, self.num_heads, self.head_dim_kq).transpose(1, 2)  # (B, H, T_q, d_k)
+        k = self.k_proj(kv).view(B, T_kv, self.num_heads, self.head_dim_kq).transpose(1, 2)
+        v = self.v_proj(kv).view(B, T_kv, self.num_heads, self.head_dim_v).transpose(1, 2)
+
+        # Attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim_kq)  # (B, H, T_q, T_kv)
+
+        if self.causal and T_q == T_kv:
+            causal_mask = self.causal_mask[:T_q, :T_kv]  # (T_q, T_kv)
+            attn_scores = attn_scores + causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T_q, T_kv)
+
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Weighted sum of values
+        attn_output = torch.matmul(attn_probs, v)  # (B, H, T_q, d_v)
+
+        # Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T_q, self.output_value_dim)
+
+        return self.out_proj(attn_output)
+
